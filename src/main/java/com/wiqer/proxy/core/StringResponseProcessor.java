@@ -1,22 +1,16 @@
 package com.wiqer.proxy.core;
 
-
-
-
 import com.wiqer.proxy.base.SemaphoreReleaseOnlyOnce;
-import io.netty.handler.codec.http.DefaultHttpRequest;
 import io.netty.handler.codec.http.HttpObject;
-import io.netty.handler.codec.http.HttpResponse;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-
-public class ResponseProcessor {
-    private final Long opaque;
+public class StringResponseProcessor {
+    private final String opaque;
     private final long timeout;
-    private final InvokeCallback invokeCallback;
+    private final StringInvokeCallback invokeCallback;
     private final long beginTimestamp = System.currentTimeMillis();
     private final CountDownLatch countDownLatch = new CountDownLatch(1);
     private final SemaphoreReleaseOnlyOnce once;
@@ -26,7 +20,7 @@ public class ResponseProcessor {
     private volatile boolean sendRequestOK = true;
     private volatile Throwable cause;
 
-    public ResponseProcessor(Long opaque, long timeout, InvokeCallback invokeCallback, SemaphoreReleaseOnlyOnce once) {
+    public StringResponseProcessor(String opaque, long timeout, StringInvokeCallback invokeCallback, SemaphoreReleaseOnlyOnce once) {
         this.opaque = opaque;
         this.timeout = timeout;
         this.invokeCallback = invokeCallback;
@@ -79,7 +73,7 @@ public class ResponseProcessor {
         return timeout;
     }
 
-    public InvokeCallback getInvokeCallback() {
+    public StringInvokeCallback getInvokeCallback() {
         return invokeCallback;
     }
 
@@ -99,7 +93,7 @@ public class ResponseProcessor {
         this.responseMessage = responseMessage;
     }
 
-    public Long getOpaque() {
+    public String getOpaque() {
         return opaque;
     }
 

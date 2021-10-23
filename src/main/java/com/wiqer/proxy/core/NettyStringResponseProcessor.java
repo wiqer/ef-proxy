@@ -1,15 +1,15 @@
 package com.wiqer.proxy.core;
 
-
-
 import com.wiqer.proxy.base.SemaphoreReleaseOnlyOnce;
 import io.netty.channel.Channel;
 
-
-public class NettyResponseProcessor extends ResponseProcessor {
+/**
+ * @author Administrator
+ */
+public class NettyStringResponseProcessor extends StringResponseProcessor {
     private final Channel processChannel;
 
-    public NettyResponseProcessor(Channel channel, Long opaque, long timeout, InvokeCallback invokeCallback, SemaphoreReleaseOnlyOnce once) {
+    public NettyStringResponseProcessor(Channel channel, String opaque, long timeout, StringInvokeCallback invokeCallback, SemaphoreReleaseOnlyOnce once) {
         super(opaque, timeout, invokeCallback, once);
         this.processChannel = channel;
     }

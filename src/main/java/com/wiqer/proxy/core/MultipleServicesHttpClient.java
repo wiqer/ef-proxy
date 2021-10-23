@@ -2,17 +2,20 @@ package com.wiqer.proxy.core;
 
 import com.wiqer.proxy.base.SemaphoreReleaseOnlyOnce;
 import com.wiqer.proxy.exception.FailConnectException;
+import com.wiqer.proxy.utils.IdUtils;
 import com.wiqer.proxy.utils.IpUtils;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.http.DefaultHttpRequest;
+import io.netty.handler.codec.http.HttpObject;
+import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.concurrent.DefaultEventExecutorGroup;
+import io.netty.util.concurrent.EventExecutorGroup;
 import org.apache.log4j.Logger;
 
 import java.util.HashMap;
@@ -38,15 +41,20 @@ public class MultipleServicesHttpClient implements ProxyStarter {
     private final Lock lockChannelTables = new ReentrantLock();
     private final ConcurrentMap<String, ChannelWrapper> channelTables = new ConcurrentHashMap<String, ChannelWrapper>();
     //堵塞器的容器
-    protected final ConcurrentHashMap<Integer, NettyResponseProcessor> responseTable = new ConcurrentHashMap<Integer, NettyResponseProcessor>(256);
+    protected final ConcurrentHashMap<Long, NettyResponseProcessor> responseTable = new ConcurrentHashMap<Long, NettyResponseProcessor>(256);
 
+    //服务管道到处理器的映射
+    protected final ConcurrentHashMap<String, NettyStringResponseProcessor> responseCanalTable = new ConcurrentHashMap<String, NettyStringResponseProcessor>(256);
     //并发度
     protected final Semaphore semaphoreAsync = new Semaphore(65535/64, true);;
 
     private final Bootstrap bootstrap;
     private final EventLoopGroup selector;
+    private final EventExecutorGroup singleEventExecutor;
 
     private ClientConfig config;
+
+
 
     private final ExecutorService publicExecutor;
 
@@ -59,7 +67,7 @@ public class MultipleServicesHttpClient implements ProxyStarter {
     public MultipleServicesHttpClient() {
 
         this.bootstrap = new Bootstrap();
-
+        this.singleEventExecutor=new NioEventLoopGroup(1);
         this.selector = new NioEventLoopGroup(1, new ThreadFactory() {
             private AtomicInteger index = new AtomicInteger(0);
 
@@ -95,11 +103,12 @@ public class MultipleServicesHttpClient implements ProxyStarter {
                         pipeline.addLast(
                                 new HttpClientCodec()
                         );
+                        pipeline.addLast( singleEventExecutor,new NettyClientHandler(MultipleServicesHttpClient.this));
                     }
                 });
     }
 
-    public HttpResponse invokeSync(String addr, DefaultHttpRequest request, long timeout) throws Exception {
+    public HttpObject invokeSync(String addr, HttpRequest request, long timeout) throws Exception {
         long beginTime = System.currentTimeMillis();
         final Channel channel = this.createChannel(addr);
         if (channel != null && channel.isActive()) {
@@ -108,7 +117,7 @@ public class MultipleServicesHttpClient implements ProxyStarter {
                 if (costTime > timeout) {
                     throw new Exception("invokeSync call timeout!addr:"+addr);
                 }
-                HttpResponse response = this.invokeSyncImpl(channel, request, timeout-costTime);
+                HttpObject response = this.invokeSyncImpl(channel, request, timeout-costTime);
                 return response;
             }catch (Exception e) {
                 this.closeChannel(channel);
@@ -120,8 +129,64 @@ public class MultipleServicesHttpClient implements ProxyStarter {
         }
     }
 
+    public void asyncProxy(String addr, HttpRequest request, long timeout, StringInvokeCallback invokeCallback) throws Exception {
+        long beginTime = System.currentTimeMillis();
+        final Channel channel = createChannel(addr);
+        if (channel != null && channel.isActive()) {
+            try {
+                long costTime = System.currentTimeMillis() - beginTime;
+                if (costTime > timeout) {
+                    throw new Exception("invokeAsync call timeout!");
+                }
 
-    public void invokeAsync(String addr, DefaultHttpRequest request, long timeout, InvokeCallback invokeCallback) throws Exception {
+                this.asyncProxyImpl(channel, request, timeout, invokeCallback);
+            }catch (Exception e) {
+                this.closeChannel(channel);
+                throw e;
+            }
+        }else {
+            this.closeChannel(channel);
+            throw new Exception("Create channel exception " +addr);
+        }
+    }
+    public void asyncProxyImpl(final Channel channel, final HttpRequest request, final long timeout, final StringInvokeCallback invokeCallback) throws Exception {
+        final String serviceChannelId=  channel.id().asLongText();
+        long beginTime = System.currentTimeMillis();
+        boolean acquire = semaphoreAsync.tryAcquire(timeout, TimeUnit.MILLISECONDS);
+        long costTime = System.currentTimeMillis() - beginTime;
+        if (acquire) {
+            final SemaphoreReleaseOnlyOnce once = new SemaphoreReleaseOnlyOnce(semaphoreAsync);
+            if (costTime > timeout) {
+                once.release();
+                throw new Exception("invoke async call timeout!");
+            }
+
+            final NettyStringResponseProcessor responseProcessor = new NettyStringResponseProcessor(channel, serviceChannelId, timeout-costTime, invokeCallback, once);
+            responseCanalTable.put(serviceChannelId, responseProcessor);
+            try {
+                channel.writeAndFlush(request).addListener(new ChannelFutureListener() {
+                    @Override
+                    public void operationComplete(ChannelFuture channelFuture) throws Exception {
+                        if (channelFuture.isSuccess()) {
+                            responseProcessor.setSendRequestOK(true);
+                            return;
+                        }
+                        requestFail(serviceChannelId);
+                    }
+                });
+            }catch (Exception e) {
+                once.release();
+                throw new Exception(e);
+            }
+        }else {
+            if (timeout <= 0) {
+                throw new Exception("invoke too fast!");
+            }else {
+                throw new Exception("SemaphoreAsync overload!");
+            }
+        }
+    }
+    public void invokeAsync(String addr, HttpRequest request, long timeout, InvokeCallback invokeCallback) throws Exception {
         long beginTime = System.currentTimeMillis();
         final Channel channel = createChannel(addr);
         if (channel != null && channel.isActive()) {
@@ -141,8 +206,8 @@ public class MultipleServicesHttpClient implements ProxyStarter {
             throw new Exception("Create channel exception " +addr);
         }
     }
-    public HttpResponse invokeSyncImpl(final Channel channel, final DefaultHttpRequest request, final long timeout) throws Exception {
-        final int opaque =requestId.incrementAndGet();;
+    public HttpObject invokeSyncImpl(final Channel channel, final HttpRequest request, final long timeout) throws Exception {
+        final Long opaque =IdUtils.randomSnowFlowerId();
         try {
             final NettyResponseProcessor responseProcessor = new NettyResponseProcessor(channel, opaque, timeout, null, null);
             //先把堵塞器添加到map中 key是opaque
@@ -162,7 +227,7 @@ public class MultipleServicesHttpClient implements ProxyStarter {
             });
 
             //进入堵塞
-            HttpResponse response = responseProcessor.waitResponse(timeout);
+            HttpObject response = responseProcessor.waitResponse(timeout);
             if (response == null) {
                 if (responseProcessor.isSendRequestOK()) {
                     throw new Exception("Send request is success, but response is timeout!");
@@ -177,8 +242,8 @@ public class MultipleServicesHttpClient implements ProxyStarter {
         }
     }
 
-    public void invokeAsyncImpl(final Channel channel, final DefaultHttpRequest request, final long timeout, final InvokeCallback invokeCallback) throws Exception {
-        final int opaque =requestId.incrementAndGet();
+    public void invokeAsyncImpl(final Channel channel, final HttpRequest request, final long timeout, final InvokeCallback invokeCallback) throws Exception {
+        final Long opaque = IdUtils.randomSnowFlowerId();
         long beginTime = System.currentTimeMillis();
         boolean acquire = semaphoreAsync.tryAcquire(timeout, TimeUnit.MILLISECONDS);
         long costTime = System.currentTimeMillis() - beginTime;
@@ -214,8 +279,22 @@ public class MultipleServicesHttpClient implements ProxyStarter {
             }
         }
     }
-    private void requestFail(final int opaque) {
+    private void requestFail(final Long opaque) {
         NettyResponseProcessor responseProcessor = responseTable.get(opaque);
+        if (responseProcessor != null) {
+            responseProcessor.setSendRequestOK(false);
+            responseProcessor.putResponse(null);
+            try {
+                executeInvokeCallback(responseProcessor);
+            }catch (Throwable e) {
+                LOGGER.error("Request fail " + e.getMessage());
+            }finally {
+                responseProcessor.release();
+            }
+        }
+    }
+    private void requestFail(final String opaque) {
+        NettyStringResponseProcessor responseProcessor = responseCanalTable.get(opaque);
         if (responseProcessor != null) {
             responseProcessor.setSendRequestOK(false);
             responseProcessor.putResponse(null);
@@ -264,6 +343,103 @@ public class MultipleServicesHttpClient implements ProxyStarter {
             }finally {
                 responseProcessor.release();
             }
+        }
+    }
+
+    private void executeInvokeCallback(final NettyStringResponseProcessor responseProcessor) {
+        boolean flag = false;
+        ExecutorService executor = this.getCallbackExecutor();
+        if (executor != null) {
+            try {
+                executor.submit(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            responseProcessor.executeInvokeCallback();
+                        }catch (Throwable e) {
+                            LOGGER.error(e.getMessage());
+                        }finally {
+                            responseProcessor.release();
+                        }
+                    }
+                });
+            }catch(Exception e) {
+                LOGGER.error(e.getMessage());
+                flag = true;
+            }
+        }else {
+            flag = true;
+        }
+
+        if (flag) {
+            try {
+                responseProcessor.executeInvokeCallback();
+            }catch (Throwable e) {
+                LOGGER.error(e.getMessage());
+            }finally {
+                responseProcessor.release();
+            }
+        }
+    }
+    public void processMessageReceived(ChannelHandlerContext ctx, HttpObject msg) {
+        final HttpObject message = msg;
+        /**
+         * 将消息返回服务端
+         */
+        final String serviceChannelId=   ctx.channel().id().asLongText();
+        final NettyStringResponseProcessor processor=   responseCanalTable.get(serviceChannelId);
+        if (processor != null) {
+            responseCanalTable.remove(serviceChannelId);
+            boolean flag = false;
+            ExecutorService executor = this.getCallbackExecutor();
+            if (executor != null) {
+                try {
+                    executor.submit(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                processor.executeInvokeCallback();
+                            } catch (Throwable e) {
+                                LOGGER.error(e.getMessage());
+                            } finally {
+                                processor.release();
+                            }
+                        }
+                    });
+                } catch (Exception e) {
+                    LOGGER.error(e.getMessage());
+                    flag = true;
+                }
+            } else {
+                flag = true;
+            }
+
+            if (flag) {
+                try {
+                    processor.executeInvokeCallback();
+                } catch (Throwable e) {
+                    LOGGER.error(e.getMessage());
+                } finally {
+                    processor.release();
+                }
+            }
+        }
+    }
+    private void processResponseMessage(ChannelHandlerContext ctx, HttpObject msg) {
+        final Long opaque = IdUtils.randomSnowFlowerId();
+        NettyResponseProcessor responseProcessor = responseTable.get(opaque);
+        if (responseProcessor != null) {
+            responseProcessor.setResponseMessage(msg);
+            responseTable.remove(opaque);
+
+            if (responseProcessor.getInvokeCallback() != null) {
+                executeInvokeCallback(responseProcessor);
+            }else {
+                responseProcessor.putResponse(msg);
+                responseProcessor.release();
+            }
+        }else {
+            LOGGER.warn("receive response, but not matched any request by " + ctx.channel().remoteAddress().toString());
         }
     }
     @Override
@@ -385,5 +561,13 @@ public class MultipleServicesHttpClient implements ProxyStarter {
         public ChannelFuture getChannelFuture() {
             return channelFuture;
         }
+    }
+
+    public ClientConfig getConfig() {
+        return config;
+    }
+
+    public void setConfig(ClientConfig config) {
+        this.config = config;
     }
 }

@@ -22,8 +22,8 @@ public class HttpServerHandler extends SimpleChannelInboundHandler<HttpObject> {
         this.servicesHttpClient=servicesHttpClient;
     }
     @Override
-    protected void channelRead0(ChannelHandlerContext ctx, HttpObject msg) throws Exception {
-
+    protected void channelRead0(ChannelHandlerContext channelHandlerContext, HttpObject msg) throws Exception {
+       final ChannelHandlerContext ctx=channelHandlerContext;
 
         LOGGER.info("对应的channel=" + ctx.channel() + " pipeline=" + ctx
         .pipeline() + " 通过pipeline获取channel" + ctx.pipeline().channel());
@@ -44,26 +44,17 @@ public class HttpServerHandler extends SimpleChannelInboundHandler<HttpObject> {
             HttpRequest httpRequest = (HttpRequest) msg;
             //获取uri, 过滤指定的资源
             URI uri = new URI(httpRequest.uri());
-            if("/favicon.ico".equals(uri.getPath())) {
-                LOGGER.info("请求了 favicon.ico, 不做响应");
-                return;
-            }
-            //servicesHttpClient.
-            //转发消息
-            DefaultHttpRequest request  =   new DefaultHttpRequest(HttpVersion.HTTP_1_1, httpRequest.method(),httpRequest.uri(), httpRequest.headers());
 
-                //回复信息给浏览器 [http协议]
+            LOGGER.info("uri:"+uri.getPath());
+            //DefaultHttpRequest request  =   new DefaultHttpRequest(HttpVersion.HTTP_1_1, httpRequest.method(),httpRequest.uri(), httpRequest.headers());
 
-            ByteBuf content = Unpooled.copiedBuffer("hello, 我是服务器", CharsetUtil.UTF_8);
+            servicesHttpClient.asyncProxy(servicesHttpClient.getConfig().getNodeAddress(), httpRequest, 10 * 1000, new StringInvokeCallback() {
+                @Override
+                public void operationComplete(StringResponseProcessor responseProcessor) {
+                    ctx.writeAndFlush(responseProcessor.getResponseMessage());
+                }
+            });
 
-            //构造一个http的相应，即 httpresponse
-            FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK, content);
-
-            response.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain");
-            response.headers().set(HttpHeaderNames.CONTENT_LENGTH, content.readableBytes());
-
-            //将构建好 response返回
-            ctx.writeAndFlush(response);
 
         }
     }
